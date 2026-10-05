@@ -1,0 +1,10 @@
+{
+  "name": "obsidian-safe-filename",
+  "version": "1.2.0",
+  "description": "Obsidian plugin: any characters in note names, original name kept in title",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node tests/test.js"
+  }
+}
