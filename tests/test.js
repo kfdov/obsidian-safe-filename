@@ -246,6 +246,44 @@ const tick = () => new Promise((r) => setImmediate(r));
   eq(plugin.matchesNumbered('Без названия смысла', 'Без названия'), false, 'дата: обычные слова не путает с датой');
   plugin.settings.duplicateMode = 'number';
 
+  // 13. Заметка открыта в редакторе: свойства пишутся через редактор, курсор уходит под них
+  // Курсор как в CodeMirror: вставка ровно в позицию курсора оставляет его перед вставкой.
+  const mkEditor = (text, cur) => ({
+    text, cur,
+    getValue() { return this.text; },
+    getCursor() { return { o: this.cur }; },
+    setCursor(p) { this.cur = p.o; },
+    posToOffset(p) { return p.o; },
+    offsetToPos(o) { return { o }; },
+    replaceRange(s, a, b) {
+      this.text = this.text.slice(0, a.o) + s + this.text.slice(b.o);
+      if (this.cur >= b.o && this.cur > a.o) this.cur += s.length - (b.o - a.o);
+      else if (this.cur > a.o) this.cur = a.o;
+    },
+    enter() { this.replaceRange('\n', { o: this.cur }, { o: this.cur }); this.cur += 1; },
+  });
+  const en = await mk('Untitled');
+  const ev = new MarkdownView(app, en);
+  ev.getMode = () => 'source';
+  ev.editor = mkEditor('', 0); // новая пустая заметка, курсор в начале — как после Enter в заголовке
+  await rename(ev, 'Энтер: тест');
+  eq(ev.editor.text, '---\ntitle: Энтер: тест\n---\n', 'редактор: свойства записаны через редактор');
+  eq(ev.editor.cur, ev.editor.text.length, 'редактор: курсор под свойствами, а не перед ---');
+  ev.editor.enter();
+  eq(ev.editor.text.startsWith('---\n'), true, 'второй Enter не ломает свойства');
+
+  // Уже есть текст и курсор в нём — курсор сдвигается вместе с текстом
+  const en2 = await mk('С текстом');
+  const ev2 = new MarkdownView(app, en2);
+  ev2.getMode = () => 'source';
+  ev2.editor = mkEditor('---\nтег: x\n---\nПривет', 17);
+  await rename(ev2, 'Q?');
+  eq(ev2.editor.text, '---\nтег: x\ntitle: Q?\n---\nПривет', 'редактор: существующие свойства сохранены');
+  eq(ev2.editor.text.slice(ev2.editor.cur), 'ивет', 'редактор: курсор остался на том же месте в тексте');
+  // Переименование в чистое имя — свой title убирается тоже через редактор
+  await rename(ev2, 'Чистое');
+  eq(ev2.editor.text, '---\nтег: x\n---\nПривет', 'редактор: title удалён, остальное на месте');
+
   eq(warnings, [], 'ни одного предупреждения Obsidian за прогон');
   plugin.onunload();
   eq(MarkdownView.prototype.saveTitle === ob._YZ.prototype.saveTitle && !Object.prototype.hasOwnProperty.call(vault, 'nonexistent'), true, 'патчи сняты');

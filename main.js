@@ -2,7 +2,7 @@
 
 const {
   Plugin, PluginSettingTab, Setting, Modal, MarkdownView, WorkspaceLeaf, Notice,
-  TAbstractFile, TFile, TFolder, normalizePath, parseLinktext, moment,
+  TAbstractFile, TFile, TFolder, normalizePath, parseLinktext, parseYaml, stringifyYaml, moment,
 } = require('obsidian');
 
 // ---------------------------------------------------------------------------
@@ -42,6 +42,8 @@ const LOOKALIKES = {
   '\\': '⧵', '/': '∕', ':': '꞉', '*': '∗', '?': '？', '"': '＂',
   '<': '‹', '>': '›', '|': 'ǀ', '#': '＃', '^': 'ˆ', '[': '［', ']': '］',
 };
+
+const FRONTMATTER_RE = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)?---[ \t]*(?:\r?\n|$)/;
 
 const RESERVED_WIN = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i;
 
@@ -165,6 +167,7 @@ class SafeFilenamePlugin extends Plugin {
     this.unpatchers = [];
     this.patchedProtos = new WeakMap();
     this.saveTimer = null;
+    this.titleOwners = new WeakMap(); // TFile -> вкладка/встраивание, где переименовывали
     this.linkJobs = new Map(); // путь из ссылки -> Promise<TFile>, чтобы двойной клик не создал два файла
 
     this.addSettingTab(new SafeFilenameSettingTab(this.app, this));
@@ -331,6 +334,7 @@ class SafeFilenamePlugin extends Plugin {
         const file = this.file;
         const renaming = !('fileBeingRenamed' in this) || this.fileBeingRenamed === file;
         if (el && file && !this.subpath && renaming) {
+          plugin.titleOwners.set(file, this); // чей редактор открыт с этой заметкой (вкладка или встраивание)
           const finalBase = plugin.prepareUiRename(file, el.textContent);
           if (finalBase != null) el.textContent = finalBase;
         }
@@ -759,11 +763,53 @@ class SafeFilenamePlugin extends Plugin {
     else delete fm.aliases;
   }
 
+  /** Открытый редактор этой заметки (вкладка в режиме редактирования или встраивание), если есть. */
+  findEditor(file) {
+    const candidates = [this.titleOwners.get(file)];
+    this.app.workspace.iterateAllLeaves((leaf) => candidates.push(leaf.view));
+    for (const c of candidates) {
+      if (!c || c.file !== file || c._loaded === false) continue;
+      let editor = null;
+      if (MarkdownView && c instanceof MarkdownView) editor = typeof c.getMode === 'function' && c.getMode() === 'source' ? c.editor : null;
+      else editor = c.editMode && c.editMode.editor;
+      if (editor && typeof editor.getValue === 'function') return editor;
+    }
+    return null;
+  }
+
+  /**
+   * Как processFrontMatter, но если заметка открыта в редакторе — правит через редактор:
+   * не расходится с несохранённым текстом и не оставляет курсор перед блоком свойств
+   * (иначе Enter сразу после ввода имени вставлял перенос перед --- и ломал свойства).
+   */
+  async editFrontMatter(file, fn) {
+    const editor = this.findEditor(file);
+    if (!editor) return this.app.fileManager.processFrontMatter(file, fn);
+
+    const text = editor.getValue();
+    const m = FRONTMATTER_RE.exec(text);
+    let fm = {};
+    if (m && m[1] && m[1].trim()) {
+      const parsed = parseYaml(m[1]);
+      // Свойства не разобрались как объект — не рискуем, пусть Obsidian сам
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return this.app.fileManager.processFrontMatter(file, fn);
+      fm = parsed;
+    }
+    fn(fm);
+
+    const block = Object.keys(fm).length ? `---\n${stringifyYaml(fm)}---\n` : '';
+    const oldEnd = m ? m[0].length : 0;
+    const cursor = editor.posToOffset(editor.getCursor());
+    if (text.slice(0, oldEnd) !== block) editor.replaceRange(block, editor.offsetToPos(0), editor.offsetToPos(oldEnd));
+    // Курсор был в начале или внутри свойств — переносим в начало текста под ними
+    if (cursor <= oldEnd) editor.setCursor(editor.offsetToPos(block.length));
+  }
+
   async applyTitle(file, original) {
     if (file.extension !== 'md') return;
     const key = this.settings.titleKey;
     try {
-      await this.app.fileManager.processFrontMatter(file, (fm) => {
+      await this.editFrontMatter(file, (fm) => {
         const old = this.managed[file.path];
         if (old) {
           if (old.alias) this.removeAlias(fm, old.alias);
@@ -794,7 +840,7 @@ class SafeFilenamePlugin extends Plugin {
     this.scheduleSave();
     if (file.extension !== 'md') return;
     try {
-      await this.app.fileManager.processFrontMatter(file, (fm) => {
+      await this.editFrontMatter(file, (fm) => {
         // Удаляем только если значение всё ещё наше (пользователь мог его отредактировать)
         if (fm[rec.key] === rec.title) delete fm[rec.key];
         if (rec.alias) this.removeAlias(fm, rec.alias);

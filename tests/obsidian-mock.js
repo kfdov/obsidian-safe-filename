@@ -52,5 +52,17 @@ module.exports = {
   Plugin, PluginSettingTab, Setting, Modal, Notice, WorkspaceLeaf, parseLinktext, _notices: notices, MarkdownView, TAbstractFile, TFile, TFolder,
   _YZ: YZ, _HP: HP, _HD: HD, _zD: zD, _checkPath: checkPath, _warnings: warnings,
   normalizePath: (p) => p.replace(/\/+/g, '/').replace(/^\/|\/$/g, ''),
+  // Упрощённый YAML: строки «ключ: значение» и списки «- значение»
+  stringifyYaml: (o) => Object.entries(o).map(([k, v]) => (Array.isArray(v) ? `${k}:\n${v.map((x) => `  - ${x}`).join('\n')}` : `${k}: ${v}`)).join('\n') + '\n',
+  parseYaml: (s) => {
+    const o = {}; let last = null;
+    for (const line of s.split('\n')) {
+      const item = /^\s+- (.*)$/.exec(line);
+      if (item && last) { (o[last] = Array.isArray(o[last]) ? o[last] : []).push(item[1]); continue; }
+      const kv = /^([^:]+):\s?(.*)$/.exec(line);
+      if (kv) { last = kv[1]; o[last] = kv[2] === '' ? [] : kv[2]; }
+    }
+    return o;
+  },
   moment: () => ({ format: (f) => ({ MMDDHHmmss: '1005143012', 'HH:mm': '14:30' }[f] || '2026-10-05 06-50') }),
 };
