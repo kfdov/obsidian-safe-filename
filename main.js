@@ -23,7 +23,8 @@ const DEFAULT_SETTINGS = {
   addAlias: false,
   interceptCreate: true,
   allowEmpty: true,
-  // Имя для пустого ввода. Пусто — стандартное «Без названия» Obsidian. Поддерживает {{date:ФОРМАТ}}.
+  // Имя для пустого ввода и для новых файлов вместо «Без названия» (Untitled).
+  // Пусто — {{date}}, т.е. «2026-10-05 14-30-12». Поддерживает {{date:ФОРМАТ}}.
   emptyName: '',
   suppressWarnings: true,
   // Ссылка вида [[name?]] на несуществующую заметку:
@@ -90,6 +91,36 @@ function sanitizeName(name, settings, opts = {}) {
 
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const DEFAULT_EMPTY_NAME = '{{date}}';
+const DEFAULT_DATE_FORMAT = 'YYYY-MM-DD HH-mm-ss';
+const DATE_TOKEN_RE = /\{\{date(?::([^}]+))?\}\}/g;
+
+/**
+ * Регулярка, узнающая отметку времени по формату moment.js:
+ * группы букв → цифры (YYYY, MM, HH…) или буквы, если там названия (MMM, ddd, Do, a);
+ * прочее — необязательный разделитель (после очистки имени он мог замениться или исчезнуть).
+ */
+function formatToRegex(fmt) {
+  return fmt
+    .replace(/\[[^\]]*\]/g, 'x')
+    .replace(/[A-Za-z]+|[^A-Za-z]/g, (m) => {
+      if (!/[A-Za-z]/.test(m)) return '[^\\p{L}\\d]?';
+      return /MMM|ddd|Do|[aAx]/.test(m) ? '[\\p{L}\\d]+' : '\\d+';
+    });
+}
+
+/** Регулярка, узнающая имя, сгенерированное по шаблону вида «Заметка {{date:…}}». */
+function templateToRegex(tpl) {
+  const literal = (s) => Array.from(s).map((ch) => (/[\p{L}\d]/u.test(ch) ? escapeRegExp(ch) : '[^\\p{L}\\d]?')).join('');
+  let out = '';
+  let last = 0;
+  for (const m of tpl.matchAll(DATE_TOKEN_RE)) {
+    out += literal(tpl.slice(last, m.index)) + formatToRegex(m[1] || DEFAULT_DATE_FORMAT);
+    last = m.index + m[0].length;
+  }
+  return out + literal(tpl.slice(last));
 }
 
 function joinPath(dir, name) {
@@ -419,17 +450,32 @@ class SafeFilenamePlugin extends Plugin {
     return sanitizeName(name, this.settings, opts);
   }
 
+  emptyTemplate() {
+    return (this.settings.emptyName || '').trim() || DEFAULT_EMPTY_NAME;
+  }
+
+  /** Имя по шаблону — для пустого ввода и для новых файлов вместо «Без названия». */
   emptyBase() {
-    let tpl = (this.settings.emptyName || '').trim();
-    if (!tpl) {
-      // Тот же текст, что у Obsidian для новой заметки («Без названия» / «Untitled»).
-      // Ключи i18next у Obsidian в kebab-case; если перевода нет, t() возвращает сам ключ.
-      const key = 'plugins.file-explorer.label-untitled-file';
-      try { tpl = window.i18next.t(key); } catch (e) { tpl = ''; }
-      if (tpl === key) tpl = '';
-    }
-    tpl = (tpl || 'Untitled').replace(/\{\{date(?::([^}]+))?\}\}/g, (_, fmt) => moment().format(fmt || 'YYYY-MM-DD HH-mm-ss'));
-    return this.sanitize(tpl) || 'Untitled';
+    const name = this.emptyTemplate().replace(DATE_TOKEN_RE, (_, fmt) => moment().format(fmt || DEFAULT_DATE_FORMAT));
+    return this.sanitize(name) || this.sanitize(moment().format(DEFAULT_DATE_FORMAT));
+  }
+
+  /** Имя уже сгенерировано по шаблону (возможно, с номером/датой от совпадения). */
+  isAutoName(name) {
+    return new RegExp(`^${templateToRegex(this.emptyTemplate())}(${this.dupSuffixRegex()})?$`, 'iu').test(name);
+  }
+
+  /** «Untitled» / «Без названия» (с номером или без) — имя, которое Obsidian даёт сам. */
+  isObsidianDefaultName(base) {
+    const labels = new Set(['Untitled']);
+    // Ключи i18next у Obsidian в kebab-case; если перевода нет, t() возвращает сам ключ
+    const key = 'plugins.file-explorer.label-untitled-file';
+    try {
+      const t = window.i18next.t(key);
+      if (t && t !== key) labels.add(t);
+    } catch (e) { /* нет i18next — только английское */ }
+    const alt = Array.from(labels).map(escapeRegExp).join('|');
+    return new RegExp(`^(?:${alt})(?: \\d+)?$`).test(base);
   }
 
   /** Суффикс-отметка времени для режима «дата/время» (уже очищенный). */
@@ -438,23 +484,17 @@ class SafeFilenamePlugin extends Plugin {
     return this.sanitize(moment().format(fmt), { keepLeadingDot: true });
   }
 
+  /** Суффикс, который добавляется при совпадении имён: номер или (в режиме даты) отметка времени. */
+  dupSuffixRegex() {
+    const sep = escapeRegExp(this.settings.numberSeparator);
+    if (this.settings.duplicateMode !== 'date') return `${sep}\\d+`;
+    const fmt = (this.settings.duplicateDateFormat || '').trim() || DEFAULT_SETTINGS.duplicateDateFormat;
+    return `${sep}(?:\\d+|${formatToRegex(fmt)}(?:${sep}\\d+)?)`;
+  }
+
   /** base, base + номер, или (в режиме даты) base + отметка времени по формату. */
   matchesNumbered(name, base) {
-    const sep = escapeRegExp(this.settings.numberSeparator);
-    let suffix = `${sep}\\d+`;
-    if (this.settings.duplicateMode === 'date') {
-      // Группы букв формата → цифры (YYYY, MM, HH…) или буквы, если там названия (MMM, ddd, Do, a);
-      // всё прочее — необязательный разделитель (после очистки он мог замениться или исчезнуть)
-      const fmt = (this.settings.duplicateDateFormat || '').trim() || DEFAULT_SETTINGS.duplicateDateFormat;
-      const stamp = fmt
-        .replace(/\[[^\]]*\]/g, 'x')
-        .replace(/[A-Za-z]+|[^A-Za-z]/g, (m) => {
-          if (!/[A-Za-z]/.test(m)) return '[^\\p{L}\\d]?';
-          return /MMM|ddd|Do|[aAx]/.test(m) ? '[\\p{L}\\d]+' : '\\d+';
-        });
-      suffix = `${sep}(?:\\d+|${stamp}(?:${sep}\\d+)?)`;
-    }
-    return new RegExp(`^${escapeRegExp(base)}(${suffix})?$`, 'iu').test(name);
+    return new RegExp(`^${escapeRegExp(base)}(${this.dupSuffixRegex()})?$`, 'iu').test(name);
   }
 
   /**
@@ -500,10 +540,9 @@ class SafeFilenamePlugin extends Plugin {
     const dir = file.parent ? file.parent.path : '';
     let base = typed ? this.sanitize(typed) : '';
     if (!base) {
-      const empty = this.emptyBase();
-      // Уже «Без названия N» — не перенумеровываем
-      if (this.matchesNumbered(current, empty)) return { finalBase: current, original: typed || null, current };
-      base = empty;
+      // Имя уже сгенерировано по шаблону — не генерируем заново
+      if (this.isAutoName(current)) return { finalBase: current, original: typed || null, current };
+      base = this.emptyBase();
     }
     return { finalBase: this.uniqueBase(dir, base, ext, file), original: typed || null, current };
   }
@@ -601,10 +640,18 @@ class SafeFilenamePlugin extends Plugin {
   }
 
   fixCreatePath(path, isFolder) {
-    if (!this.settings.interceptCreate || typeof path !== 'string') return path;
+    if (typeof path !== 'string') return path;
     const { dir, last } = splitPath(normalizePath(path));
     const { base, ext } = isFolder ? { base: last, ext: '' } : splitExt(last);
     const note = !isFolder && NOTE_EXTS.has(ext.toLowerCase());
+
+    // Все пути создания (Ctrl+N, проводник, Bases, холст, CLI) сходятся в vault.create —
+    // здесь стандартное «Без названия N» меняется на имя по шаблону плагина.
+    if (note && this.isObsidianDefaultName(base)) {
+      return joinPath(dir, withExt(this.uniqueBase(dir, this.emptyBase(), ext, null), ext));
+    }
+
+    if (!this.settings.interceptCreate) return path;
     const clean = this.sanitize(base, { keepLeadingDot: true, forbidden: note ? undefined : OS_FORBIDDEN });
     if (clean === base) return path;
 
@@ -925,10 +972,12 @@ class SafeFilenameSettingTab extends PluginSettingTab {
       .setDesc('Если стереть имя целиком, файл получит имя по умолчанию вместо ошибки.')
       .addToggle((t) => t.setValue(s.allowEmpty).onChange(async (v) => { s.allowEmpty = v; await save(); }));
 
-    new Setting(containerEl)
+    let nameSetting;
+    const nameDesc = () => nameSetting.setDesc(`Для новых файлов и пустого ввода. Можно {{date:ФОРМАТ}}, пусто — {{date}}. Сейчас получится: «${this.plugin.emptyBase()}».`);
+    nameSetting = new Setting(containerEl)
       .setName('Имя по умолчанию')
-      .setDesc('Для пустого ввода. Пусто — стандартное «Без названия». Можно {{date:YYYY-MM-DD HH-mm}}.')
-      .addText((t) => t.setPlaceholder('Без названия').setValue(s.emptyName).onChange(async (v) => { s.emptyName = v; await save(); }));
+      .addText((t) => t.setPlaceholder(DEFAULT_EMPTY_NAME).setValue(s.emptyName).onChange(async (v) => { s.emptyName = v; await save(); nameDesc(); }));
+    nameDesc();
 
     new Setting(containerEl)
       .setName('Скрывать предупреждения о недопустимом имени')

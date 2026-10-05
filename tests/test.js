@@ -137,14 +137,14 @@ const tick = () => new Promise((r) => setImmediate(r));
   eq(fms[a.path].aliases, ['свой'], 'добавленный плагином alias удалён');
   plugin.settings.addAlias = false;
 
-  // 5. Пустое имя
+  // 5. Пустое имя → имя по шаблону (по умолчанию дата и время)
   await rename(view, '   ');
-  eq(a.path, 'notes/Без названия.md', 'пустое имя -> «Без названия»');
+  eq(a.path, 'notes/2026-10-05 06-50.md', 'пустое имя -> дата и время');
   const b = await mk('Ж'); const vb = new MarkdownView(app, b);
   await rename(vb, '');
-  eq(b.path, 'notes/Без названия 1.md', 'второе пустое -> «Без названия 1»');
+  eq(b.path, 'notes/2026-10-05 06-50 1.md', 'второе пустое в ту же минуту -> + номер');
   await rename(vb, '???');
-  eq(b.path, 'notes/Без названия 1.md', '«???» у безымянного — без перенумерации');
+  eq(b.path, 'notes/2026-10-05 06-50 1.md', '«???» у уже сгенерированного имени — без переименования');
 
   // 6. Bases: встроенная заметка в поповере
   const nb = await mk('Untitled');
@@ -219,12 +219,28 @@ const tick = () => new Promise((r) => setImmediate(r));
   eq(ob._notices.length, 1, 'block: показана подсказка');
   plugin.settings.brokenLinks = 'fix';
 
-  // 11. Имя по умолчанию: если перевода нет, i18next возвращает ключ — его в имя не пускаем
-  const realT = window.i18next.t;
-  window.i18next.t = (k) => k;
-  eq(plugin.emptyBase(), 'Untitled', 'нет перевода → Untitled, а не ключ');
-  window.i18next.t = realT;
-  eq(plugin.emptyBase(), 'Без названия', 'перевод по настоящему ключу');
+  // 11. Настройка «Имя по умолчанию»
+  eq(plugin.emptyBase(), '2026-10-05 06-50', 'по умолчанию — дата и время');
+  plugin.settings.emptyName = 'Заметка {{date:HH:mm}}';
+  eq(plugin.emptyBase(), 'Заметка 14 30', 'свой шаблон; двоеточие из формата заменено');
+  eq(plugin.isAutoName('Заметка 14 30'), true, 'узнаёт имя по своему шаблону');
+  eq(plugin.isAutoName('Заметка 14 30 2'), true, '…и с номером от совпадения');
+  eq(plugin.isAutoName('Заметка про кота'), false, 'обычное имя не считает сгенерированным');
+  plugin.settings.emptyName = '???';
+  eq(plugin.emptyBase(), '2026-10-05 06-50', 'шаблон из одних запрещённых символов → дата');
+  plugin.settings.emptyName = '';
+
+  // Новые файлы: стандартное «Untitled» / «Без названия» Obsidian → имя из той же настройки
+  const u1 = await vault.create('Untitled.md');
+  eq(u1.path, '2026-10-05 06-50.md', 'Untitled.md → имя по шаблону');
+  const u2 = await vault.create('Без названия 3.md');
+  eq(u2.path, '2026-10-05 06-50 1.md', '«Без названия 3» (локализованное, с номером) → по шаблону + номер');
+  const u3 = await vault.create('Untitled.canvas');
+  eq(u3.path, '2026-10-05 06-50.canvas', 'холст тоже');
+  const u4 = await vault.create('Untitled notes.md');
+  eq(u4.path, 'Untitled notes.md', 'обычное имя со словом Untitled не трогается');
+  const u5 = await vault.create('Untitled.png');
+  eq(u5.path, 'Untitled.png', 'вложения не трогаются');
 
   // 12. Режим «дата/время» вместо номера
   plugin.settings.duplicateMode = 'date';
