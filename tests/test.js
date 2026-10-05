@@ -5,7 +5,7 @@ const origLoad = Module._load;
 Module._load = function (req, ...rest) { return req === 'obsidian' ? mock : origLoad.call(this, req, ...rest); };
 const ob = mock;
 const { TFile, TFolder, Modal, MarkdownView, _HP: HP, _HD: HD, _zD: zD, _checkPath: checkPath, _warnings: warnings } = ob;
-global.window = { setTimeout: () => 0, clearTimeout() {}, i18next: { t: () => 'Без названия' } };
+global.window = { setTimeout: () => 0, clearTimeout() {}, i18next: { t: (k) => (k === 'plugins.file-explorer.label-untitled-file' ? 'Без названия' : k) } };
 global.document = {};
 const assert = require('assert');
 let pass = 0;
@@ -218,6 +218,33 @@ const tick = () => new Promise((r) => setImmediate(r));
   eq(vault.getMarkdownFiles().length, before, 'block: файл не создан');
   eq(ob._notices.length, 1, 'block: показана подсказка');
   plugin.settings.brokenLinks = 'fix';
+
+  // 11. Имя по умолчанию: если перевода нет, i18next возвращает ключ — его в имя не пускаем
+  const realT = window.i18next.t;
+  window.i18next.t = (k) => k;
+  eq(plugin.emptyBase(), 'Untitled', 'нет перевода → Untitled, а не ключ');
+  window.i18next.t = realT;
+  eq(plugin.emptyBase(), 'Без названия', 'перевод по настоящему ключу');
+
+  // 12. Режим «дата/время» вместо номера
+  plugin.settings.duplicateMode = 'date';
+  const dd = await mk('дата');
+  const vd = new MarkdownView(app, dd);
+  await rename(vd, 'Вопрос: что?');
+  eq(dd.path, 'notes/Вопрос что 1005143012.md', 'дата: суффикс по формату MMDDHHmmss');
+  eq(fms[dd.path].title, 'Вопрос: что?', 'дата: title');
+  const dd2 = await mk('дата2');
+  await rename(new MarkdownView(app, dd2), 'Вопрос что');
+  eq(dd2.path, 'notes/Вопрос что 1005143012 1.md', 'дата: в ту же секунду — ещё и номер');
+  plugin.settings.duplicateDateFormat = 'HH:mm';
+  const dd3 = await mk('дата3');
+  await rename(new MarkdownView(app, dd3), 'Вопрос что');
+  eq(dd3.path, 'notes/Вопрос что 14 30.md', 'дата: двоеточие из формата тоже заменяется');
+  plugin.settings.duplicateDateFormat = 'MMDDHHmmss';
+  eq(plugin.matchesNumbered('Без названия 1005143012', 'Без названия'), true, 'дата: распознаёт свой суффикс');
+  eq(plugin.matchesNumbered('Без названия 3', 'Без названия'), true, 'дата: номер тоже распознаёт');
+  eq(plugin.matchesNumbered('Без названия смысла', 'Без названия'), false, 'дата: обычные слова не путает с датой');
+  plugin.settings.duplicateMode = 'number';
 
   eq(warnings, [], 'ни одного предупреждения Obsidian за прогон');
   plugin.onunload();

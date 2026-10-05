@@ -52,5 +52,5 @@ module.exports = {
   Plugin, PluginSettingTab, Setting, Modal, Notice, WorkspaceLeaf, parseLinktext, _notices: notices, MarkdownView, TAbstractFile, TFile, TFolder,
   _YZ: YZ, _HP: HP, _HD: HD, _zD: zD, _checkPath: checkPath, _warnings: warnings,
   normalizePath: (p) => p.replace(/\/+/g, '/').replace(/^\/|\/$/g, ''),
-  moment: () => ({ format: () => '2026-10-05 06-50' }),
+  moment: () => ({ format: (f) => ({ MMDDHHmmss: '1005143012', 'HH:mm': '14:30' }[f] || '2026-10-05 06-50') }),
 };

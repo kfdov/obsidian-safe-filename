@@ -15,6 +15,9 @@ const DEFAULT_SETTINGS = {
   replaceMode: 'char', // 'char' | 'lookalike'
   replacement: ' ',
   numberSeparator: ' ',
+  // Что добавлять к имени, если такой файл уже есть: 'number' — «Заметка 1», 'date' — «Заметка 1005143012»
+  duplicateMode: 'number',
+  duplicateDateFormat: 'MMDDHHmmss', // формат moment.js: месяц, день, часы, минуты, секунды
   titleKey: 'title',
   titleMode: 'changed', // 'changed' | 'always'
   addAlias: false,
@@ -415,18 +418,45 @@ class SafeFilenamePlugin extends Plugin {
   emptyBase() {
     let tpl = (this.settings.emptyName || '').trim();
     if (!tpl) {
-      try { tpl = window.i18next.t('plugins.fileExplorer.labelUntitledFile'); } catch (e) { tpl = ''; }
+      // Тот же текст, что у Obsidian для новой заметки («Без названия» / «Untitled»).
+      // Ключи i18next у Obsidian в kebab-case; если перевода нет, t() возвращает сам ключ.
+      const key = 'plugins.file-explorer.label-untitled-file';
+      try { tpl = window.i18next.t(key); } catch (e) { tpl = ''; }
+      if (tpl === key) tpl = '';
     }
     tpl = (tpl || 'Untitled').replace(/\{\{date(?::([^}]+))?\}\}/g, (_, fmt) => moment().format(fmt || 'YYYY-MM-DD HH-mm-ss'));
     return this.sanitize(tpl) || 'Untitled';
   }
 
-  matchesNumbered(name, base) {
-    const re = new RegExp(`^${escapeRegExp(base)}(${escapeRegExp(this.settings.numberSeparator)}\\d+)?$`, 'i');
-    return re.test(name);
+  /** Суффикс-отметка времени для режима «дата/время» (уже очищенный). */
+  dateSuffix() {
+    const fmt = (this.settings.duplicateDateFormat || '').trim() || DEFAULT_SETTINGS.duplicateDateFormat;
+    return this.sanitize(moment().format(fmt), { keepLeadingDot: true });
   }
 
-  /** Ближайшее свободное имя в папке: base, "base 1", "base 2", ... (без учёта регистра). */
+  /** base, base + номер, или (в режиме даты) base + отметка времени по формату. */
+  matchesNumbered(name, base) {
+    const sep = escapeRegExp(this.settings.numberSeparator);
+    let suffix = `${sep}\\d+`;
+    if (this.settings.duplicateMode === 'date') {
+      // Группы букв формата → цифры (YYYY, MM, HH…) или буквы, если там названия (MMM, ddd, Do, a);
+      // всё прочее — необязательный разделитель (после очистки он мог замениться или исчезнуть)
+      const fmt = (this.settings.duplicateDateFormat || '').trim() || DEFAULT_SETTINGS.duplicateDateFormat;
+      const stamp = fmt
+        .replace(/\[[^\]]*\]/g, 'x')
+        .replace(/[A-Za-z]+|[^A-Za-z]/g, (m) => {
+          if (!/[A-Za-z]/.test(m)) return '[^\\p{L}\\d]?';
+          return /MMM|ddd|Do|[aAx]/.test(m) ? '[\\p{L}\\d]+' : '\\d+';
+        });
+      suffix = `${sep}(?:\\d+|${stamp}(?:${sep}\\d+)?)`;
+    }
+    return new RegExp(`^${escapeRegExp(base)}(${suffix})?$`, 'iu').test(name);
+  }
+
+  /**
+   * Ближайшее свободное имя в папке (без учёта регистра):
+   * режим «номер» — base, "base 1", "base 2"…; режим «дата» — "base 1005143012" (при совпадении + номер).
+   */
   uniqueBase(dir, base, ext, self) {
     const folder = !dir || dir === '/' ? this.app.vault.getRoot() : this.app.vault.getAbstractFileByPath(dir);
     const taken = new Set();
@@ -437,8 +467,16 @@ class SafeFilenamePlugin extends Plugin {
     }
     const free = (b) => !taken.has(withExt(b, ext).toLowerCase());
     if (free(base)) return base;
+    const sep = this.settings.numberSeparator;
+    if (this.settings.duplicateMode === 'date') {
+      const stamp = this.dateSuffix();
+      if (stamp) {
+        base = `${base}${sep}${stamp}`;
+        if (free(base)) return base;
+      }
+    }
     for (let n = 1; ; n++) {
-      const candidate = `${base}${this.settings.numberSeparator}${n}`;
+      const candidate = `${base}${sep}${n}`;
       if (free(candidate)) return candidate;
     }
   }
@@ -801,10 +839,40 @@ class SafeFilenameSettingTab extends PluginSettingTab {
       .setDesc('Пробел по умолчанию; повторяющиеся пробелы схлопываются. Пусто — просто удалить символ.')
       .addText((t) => t.setValue(s.replacement).onChange(async (v) => { s.replacement = v; await save(); }));
 
+    const example = () => {
+      const sep = s.numberSeparator;
+      if (s.duplicateMode !== 'date') return `«Заметка» → «Заметка${sep}1», «Заметка${sep}2», …`;
+      return `«Заметка» → «Заметка${sep}${this.plugin.dateSuffix()}»; если и такая есть — ещё и номер`;
+    };
+    let dupSetting;
+    const refresh = () => dupSetting.setDesc(`Если файл уже существует: ${example()}`);
+
+    dupSetting = new Setting(containerEl)
+      .setName('При совпадении имени добавлять')
+      .addDropdown((d) => d
+        .addOption('number', 'Номер')
+        .addOption('date', 'Дату и время')
+        .setValue(s.duplicateMode)
+        .onChange(async (v) => { s.duplicateMode = v; await save(); this.display(); }));
+    refresh();
+
+    if (s.duplicateMode === 'date') {
+      new Setting(containerEl)
+        .setName('Формат даты и времени')
+        .setDesc(createFragment((f) => {
+          f.appendText('Формат moment.js: YYYY год, MM месяц, DD день, HH часы, mm минуты, ss секунды. ');
+          f.createEl('a', { text: 'Все обозначения', href: 'https://momentjs.com/docs/#/displaying/format/' });
+        }))
+        .addText((t) => t
+          .setPlaceholder(DEFAULT_SETTINGS.duplicateDateFormat)
+          .setValue(s.duplicateDateFormat)
+          .onChange(async (v) => { s.duplicateDateFormat = v; await save(); refresh(); }));
+    }
+
     new Setting(containerEl)
-      .setName('Разделитель перед номером')
-      .setDesc('Если файл уже существует: «Заметка» → «Заметка 1», «Заметка 2», …')
-      .addText((t) => t.setValue(s.numberSeparator).onChange(async (v) => { s.numberSeparator = v; await save(); }));
+      .setName('Разделитель')
+      .setDesc('Между именем и номером или датой.')
+      .addText((t) => t.setValue(s.numberSeparator).onChange(async (v) => { s.numberSeparator = v; await save(); refresh(); }));
 
     new Setting(containerEl)
       .setName('Разрешить пустое имя')
