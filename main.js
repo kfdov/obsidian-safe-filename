@@ -21,6 +21,8 @@ const DEFAULT_SETTINGS = {
   titleKey: 'title',
   titleMode: 'changed', // 'changed' | 'always'
   addAlias: false,
+  // Держать первый заголовок «# …» равным введённому имени
+  syncHeading: false,
   interceptCreate: true,
   allowEmpty: true,
   // Имя для пустого ввода и для новых файлов вместо «Без названия» (Untitled).
@@ -153,6 +155,26 @@ function replaceWikilinks(text, oldPath, newPath, display) {
     const shown = alias || (bang ? '' : `|${display}`);
     return `${bang}[[${newPath}${sub || ''}${shown}]]`;
   });
+}
+
+/**
+ * Правка первого заголовка «# …» — первой непустой строки текста под свойствами.
+ * text — что должно быть в заголовке (null — убрать, но только если там prev, т.е. наш).
+ * Возвращает { from, to, insert, inserted } или null, если менять нечего.
+ */
+function headingEdit(doc, text, prev) {
+  const fm = FRONTMATTER_RE.exec(doc);
+  const bodyStart = fm ? fm[0].length : 0;
+  const m = /^((?:[ \t]*\r?\n)*)#[ \t]+([^\r\n]*?)[ \t]*(\r?\n|$)/.exec(doc.slice(bodyStart));
+  if (m) {
+    const from = bodyStart + m[1].length;
+    const lineEnd = bodyStart + m[0].length - m[3].length;
+    if (text == null) return m[2] === prev ? { from, to: bodyStart + m[0].length, insert: '' } : null;
+    const line = `# ${text}`;
+    return doc.slice(from, lineEnd) === line ? null : { from, to: lineEnd, insert: line };
+  }
+  if (text == null) return null;
+  return { from: bodyStart, to: bodyStart, insert: `# ${text}\n`, inserted: true };
 }
 
 function toArray(v) {
@@ -555,7 +577,8 @@ class SafeFilenamePlugin extends Plugin {
       const needTitle = r.finalBase !== r.original || this.settings.titleMode === 'always';
       if (r.finalBase === r.current) {
         // Файл не переименуется (имя уже такое), но введённый вариант другой — обновим title сразу.
-        if (needTitle) this.applyTitle(file, r.original);
+        if (needTitle) this.applyTitle(file, r.original).then(() => this.syncHeading(file, r.original));
+        else this.syncHeading(file, r.original);
       } else if (needTitle) {
         const dir = file.parent ? file.parent.path : '';
         this.rememberPath(joinPath(dir, withExt(r.finalBase, file.extension)), r.original);
@@ -759,22 +782,28 @@ class SafeFilenamePlugin extends Plugin {
 
   // ---- title / aliases -----------------------------------------------------
 
-  onVaultCreate(file) {
+  async onVaultCreate(file) {
     if (!(file instanceof TFile)) return;
+    // Только файлы, созданные нашими путями: чужие создания (синхронизация, плагины) не трогаем
     const original = this.takePending(file);
-    if (original !== undefined) this.applyTitle(file, original);
+    if (original === undefined) return;
+    await this.applyTitle(file, original);
+    await this.syncHeading(file, original);
   }
 
-  onVaultRename(file, oldPath) {
+  async onVaultRename(file, oldPath) {
     this.moveRecords(file, oldPath);
     if (!(file instanceof TFile)) return;
     const original = this.takePending(file);
+    const nameChanged = basenameOfPath(oldPath) !== file.basename;
+    const rec = this.managed[file.path];
     if (original !== undefined) {
-      this.applyTitle(file, original);
-    } else if (this.managed[file.path] && basenameOfPath(oldPath) !== file.basename) {
+      await this.applyTitle(file, original);
+    } else if (rec && rec.title !== undefined && nameChanged) {
       // Имя сменилось, а наш title относился к старому имени — убираем то, что добавляли мы.
-      this.cleanupTitle(file);
+      await this.cleanupTitle(file);
     }
+    if (original !== undefined || nameChanged) await this.syncHeading(file, original);
   }
 
   onVaultDelete(file) {
@@ -864,6 +893,7 @@ class SafeFilenamePlugin extends Plugin {
         }
         fm[key] = original;
         const rec = { key, title: original };
+        if (old && old.heading !== undefined) rec.heading = old.heading;
         if (this.settings.addAlias) {
           const aliases = toArray(fm.aliases);
           if (!aliases.includes(original)) {
@@ -882,8 +912,10 @@ class SafeFilenamePlugin extends Plugin {
 
   async cleanupTitle(file) {
     const rec = this.managed[file.path];
-    if (!rec) return;
-    delete this.managed[file.path];
+    if (!rec || rec.title === undefined) return;
+    // Запись о заголовке (# …) оставляем — ею управляет syncHeading
+    if (rec.heading !== undefined) this.managed[file.path] = { heading: rec.heading };
+    else delete this.managed[file.path];
     this.scheduleSave();
     if (file.extension !== 'md') return;
     try {
@@ -895,6 +927,56 @@ class SafeFilenamePlugin extends Plugin {
     } catch (e) {
       console.error('[safe-filename] не удалось очистить title', e);
     }
+  }
+
+  // ---- Первый заголовок (# …) ---------------------------------------------
+
+  /**
+   * Держит первый заголовок заметки равным введённому имени.
+   * original — что ввёл пользователь (если известно); иначе берём title, если он про это имя, или имя файла.
+   * Для имени, сгенерированного по шаблону, убираем свой заголовок (если пользователь его не менял).
+   */
+  async syncHeading(file, original) {
+    if (!this.settings.syncHeading || file.extension !== 'md') return;
+    let text = original != null && original !== '' ? original : null;
+    if (text == null && !this.isAutoName(file.basename)) {
+      const fm = (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {};
+      const t = fm[this.settings.titleKey];
+      // title вроде «Вопрос: что?» относится к файлу «Вопрос что» — показываем его, а не очищенное имя
+      text = typeof t === 'string' && this.matchesNumbered(file.basename, this.sanitize(t)) ? t : file.basename;
+    }
+
+    const rec = this.managed[file.path];
+    const prev = rec ? rec.heading : undefined;
+    try {
+      await this.editHeading(file, text, prev);
+    } catch (e) {
+      console.error('[safe-filename] не удалось обновить заголовок', e);
+      return;
+    }
+    if (text != null) this.managed[file.path] = Object.assign({}, this.managed[file.path], { heading: text });
+    else if (rec) {
+      delete rec.heading;
+      if (!Object.keys(rec).length) delete this.managed[file.path];
+    }
+    this.scheduleSave();
+  }
+
+  async editHeading(file, text, prev) {
+    const editor = this.findEditor(file);
+    if (!editor) {
+      await this.app.vault.process(file, (doc) => {
+        const e = headingEdit(doc, text, prev);
+        return e ? doc.slice(0, e.from) + e.insert + doc.slice(e.to) : doc;
+      });
+      return;
+    }
+    const e = headingEdit(editor.getValue(), text, prev);
+    if (!e) return;
+    const cursor = editor.posToOffset(editor.getCursor());
+    editor.replaceRange(e.insert, editor.offsetToPos(e.from), editor.offsetToPos(e.to));
+    // Курсор стоял в начале текста, куда вставили заголовок, — ставим его под заголовок
+    if (e.inserted && cursor === e.from) editor.setCursor(editor.offsetToPos(e.from + e.insert.length));
   }
 }
 
@@ -1007,6 +1089,11 @@ class SafeFilenameSettingTab extends PluginSettingTab {
         .onChange(async (v) => { s.titleMode = v; await save(); }));
 
     new Setting(containerEl)
+      .setName('Синхронизировать с первым заголовком (# …)')
+      .setDesc('При переименовании первая строка заметки «# …» становится введённым именем со всеми символами; если её нет — добавляется.')
+      .addToggle((t) => t.setValue(s.syncHeading).onChange(async (v) => { s.syncHeading = v; await save(); }));
+
+    new Setting(containerEl)
       .setName('Добавлять исходное имя в aliases')
       .addToggle((t) => t.setValue(s.addAlias).onChange(async (v) => { s.addAlias = v; await save(); }));
 
@@ -1019,4 +1106,4 @@ class SafeFilenameSettingTab extends PluginSettingTab {
 
 module.exports = SafeFilenamePlugin;
 module.exports.default = SafeFilenamePlugin;
-module.exports._internal = { sanitizeName, normalizeEditable, replaceWikilinks, DEFAULT_SETTINGS };
+module.exports._internal = { sanitizeName, normalizeEditable, replaceWikilinks, headingEdit, DEFAULT_SETTINGS };

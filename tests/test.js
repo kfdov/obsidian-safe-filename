@@ -300,6 +300,42 @@ const tick = () => new Promise((r) => setImmediate(r));
   await rename(ev2, 'Чистое');
   eq(ev2.editor.text, '---\nтег: x\n---\nПривет', 'редактор: title удалён, остальное на месте');
 
+  // 14. Синхронизация с первым заголовком «# …»
+  const settle = async () => { for (let i = 0; i < 20; i++) await tick(); };
+  const { headingEdit } = P._internal;
+  eq(headingEdit('#тег\nтекст', 'X', undefined).insert, '# X\n', '«#тег» — не заголовок, вставляем новый');
+  eq(headingEdit('## Раздел', 'X', undefined).inserted, true, '«## …» — не первый заголовок, вставляем «# …»');
+  eq(headingEdit('---\na: 1\n---\n\n# Старый\nтекст', null, 'Чужой'), null, 'чужой заголовок не удаляем');
+
+  plugin.settings.syncHeading = true;
+  // Открыта в редакторе: свойства + заголовок, курсор под ними, второй Enter ничего не ломает
+  const h1 = await mk('Untitled');
+  const hv = new MarkdownView(app, h1);
+  hv.getMode = () => 'source';
+  hv.editor = mkEditor('', 0);
+  await rename(hv, 'Вопрос: как?'); await settle();
+  eq(hv.editor.text, '---\ntitle: Вопрос: как?\n---\n# Вопрос: как?\n', 'заголовок = введённое имя со всеми символами');
+  eq(hv.editor.cur, hv.editor.text.length, 'курсор под заголовком');
+  hv.editor.enter();
+  eq(hv.editor.text.startsWith('---\ntitle: Вопрос: как?\n---\n# Вопрос: как?\n'), true, 'Enter после — свойства и заголовок целы');
+  hv.editor.text = '---\ntitle: Вопрос: как?\n---\n# Вопрос: как?\nМой текст'; hv.editor.cur = hv.editor.text.length;
+  await rename(hv, 'Ответ'); await settle();
+  eq(hv.editor.text, '# Ответ\nМой текст', 'переименование: заголовок обновлён, наш title убран');
+  await rename(hv, ''); await settle();
+  eq(hv.editor.text, 'Мой текст', 'стёрли имя: свой заголовок убран');
+
+  // Не открыта в редакторе: правка через файл; существующий первый «# …» заменяется
+  const h2 = await mk('Закрытая');
+  contents[h2.path] = '\n# Как-то так\nтекст';
+  const hv2 = new MarkdownView(app, h2);
+  await rename(hv2, 'Новое: имя'); await settle();
+  eq(contents[h2.path], '\n# Новое: имя\nтекст', 'закрытая заметка: первый заголовок заменён');
+  // Пользователь поменял заголовок сам, затем стёр имя — его заголовок не трогаем
+  contents[h2.path] = '\n# Свой\nтекст';
+  await rename(hv2, ''); await settle();
+  eq(contents[h2.path], '\n# Свой\nтекст', 'изменённый пользователем заголовок не удалён');
+  plugin.settings.syncHeading = false;
+
   eq(warnings, [], 'ни одного предупреждения Obsidian за прогон');
   plugin.onunload();
   eq(MarkdownView.prototype.saveTitle === ob._YZ.prototype.saveTitle && !Object.prototype.hasOwnProperty.call(vault, 'nonexistent'), true, 'патчи сняты');
